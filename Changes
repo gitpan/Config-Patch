@@ -1,0 +1,8 @@
+######################################################################
+Revision history for Perl extension Config::Patch
+
+0.01  2005/07/15
+      * Where it all began.
+
+TODO: 
+* seek back one in append to check "\n"
