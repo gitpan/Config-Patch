@@ -9,6 +9,9 @@ use strict;
 use Test::More tests => 14;
 use Config::Patch;
 
+#use Log::Log4perl qw(:easy);
+#Log::Log4perl->easy_init($DEBUG);
+
 my $TDIR = ".";
 $TDIR = "t" if -d "t";
 my $TESTFILE = "$TDIR/testfile";
@@ -22,7 +25,7 @@ my $TESTDATA = "abc\ndef\nghi\n";
 ####################################################
 # Single patch 
 ####################################################
-blurt($TESTDATA, $TESTFILE);
+Config::Patch::blurt($TESTDATA, $TESTFILE);
 
 my $patcher = Config::Patch->new(
                   file => $TESTFILE,
@@ -47,13 +50,13 @@ $patcher = Config::Patch->new(
 
 $patcher->remove();
 
-my $data = slurp($TESTFILE);
+my $data = Config::Patch::slurp($TESTFILE);
 is($data, $TESTDATA, "Test file intact after removing patch");
 
 ####################################################
 # Double patch
 ####################################################
-blurt($TESTDATA, $TESTFILE);
+Config::Patch::blurt($TESTDATA, $TESTFILE);
 
 $patcher = Config::Patch->new(
                   file => $TESTFILE,
@@ -68,6 +71,7 @@ open FILE, ">>$TESTFILE" or die;
 print FILE $TESTDATA;
 close FILE;
 
+$patcher->key("anotherkey");
 $patcher->append(<<'EOT');
 This is
 another patch.
@@ -78,7 +82,7 @@ EOT
 ok(exists $hashref->{"foobarkey"}, "Patch exists");
 
 is($patches->[0]->[0], "foobarkey", "Patch in patch list");
-is($patches->[1]->[0], "foobarkey", "Patch in patch list");
+is($patches->[1]->[0], "anotherkey", "Patch in patch list");
 
 is($patches->[0]->[1], "append", "Patch mode correct");
 is($patches->[1]->[1], "append", "Patch mode correct");
@@ -91,30 +95,12 @@ $patcher = Config::Patch->new(
                   file => $TESTFILE,
                   key  => "foobarkey");
 
+$patcher->key("anotherkey");
 $patcher->remove();
 
-$data = slurp($TESTFILE);
+$patcher->key("foobarkey");
+$patcher->remove();
+
+$data = Config::Patch::slurp($TESTFILE);
 is($data, $TESTDATA . $TESTDATA, 
     "Test file intact after removing both patches");
-
-###############################################
-sub blurt {
-###############################################
-    my($data, $file) = @_;
-    open FILE, ">$file" or die "Cannot open $file ($!)";
-    print FILE $data;
-    close FILE;
-}
-
-###############################################
-sub slurp {
-###############################################
-    my($file) = @_;
-
-    local $/ = undef;
-    open FILE, "<$file" or die "Cannot open $file ($!)";
-    my $data = <FILE>;
-    close FILE;
-
-    return $data;
-}

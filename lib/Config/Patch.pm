@@ -9,8 +9,10 @@ package Config::Patch;
 use strict;
 use warnings;
 use MIME::Base64;
+use Set::IntSpan;
+use Log::Log4perl qw(:easy);
 
-our $VERSION     = "0.02";
+our $VERSION     = "0.03";
 our $PATCH_REGEX = qr{^#\(Config::Patch-(.*?)-(.*?)\)}m;
 
 ###########################################
@@ -26,18 +28,31 @@ sub new {
 }
 
 ###########################################
+sub key {
+###########################################
+    my($self, $key) = @_;
+
+    $self->{key} = $key if defined $key;
+    return $self->{key};
+}
+
+###########################################
 sub append {
 ###########################################
     my($self, $string) = @_;
 
-    open FILE, ">>$self->{file}" or
-        die "Cannot open $self->{file}";
+        # Has the file been patched with this key before?
+    my(undef, $keys) = $self->patches();
+    return undef if exists $keys->{$self->{key}};
 
-    print FILE $self->patch_marker("append");
-    print FILE $string;
-    print FILE $self->patch_marker("append");
+    my $data = slurp($self->{file});
+    $data .= "\n" unless substr($data, -1, 1) eq "\n";
 
-    close FILE;
+    $data .= $self->patch_marker("append");
+    $data .= $string;
+    $data .= $self->patch_marker("append");
+
+    blurt($data, $self->{file});
 }
 
 ###########################################
@@ -115,9 +130,17 @@ sub patches {
     my @patches = ();
     my %patches = ();
 
+    $self->{forbidden_zones} = Set::IntSpan->new();
+
     $self->file_parse(
-        sub { my($p, $k, $m, $t) = @_;
-              push @patches, [$k, $m, $t];
+        sub { my($p, $k, $m, $t, $p1, $p2) = @_;
+              DEBUG "union: p1=$p1 p2=$p2";
+              $p->{forbidden_zones} = Set::IntSpan::union(
+                                          $p->{forbidden_zones}, 
+                                          "$p1-$p2");
+              DEBUG "forbidden zones: ", 
+                    Set::IntSpan::run_list($p->{forbidden_zones});
+              push @patches, [$k, $m, $t, $p1, $p2];
               $patches{$k}++;
             },
         sub { },
@@ -130,6 +153,10 @@ sub patches {
 sub replace {
 ###########################################
     my($self, $search, $replace) = @_;
+
+        # Has the file been patched with this key before?
+    my(undef, $keys) = $self->patches();
+    return undef if exists $keys->{$self->{key}};
 
     if(ref($search) ne "Regexp") {
         die "replace: search parameter not a regex";
@@ -145,20 +172,24 @@ sub replace {
     my $data = join '', <FILE>;
     close FILE;
 
-    my $positions = full_line_match($data, $search);
+    my $positions = $self->full_line_match($data, $search);
     my @pieces    = ();
     my $rest      = $data;
+    my $offset    = 0;
 
     for my $pos (@$positions) {
         my($from, $to) = @$pos;
-        my $before = substr($data, 0, $from);
+        my $before = substr($data, $offset, $from-$offset);
         $rest      = substr($data, $to+1);
+        DEBUG "patch: from=$from to=$to off=$offset ",
+              "before='$before' rest='$rest'";
         my $patch  = $self->patch_marker("replace") .
                      $replace .
                      replstring_hide(substr($data, $from, $to - $from + 1)) .
                      $self->patch_marker("replace");
 
         push @pieces, $before, $patch;
+        $offset = $to + 1;
     }
 
     push @pieces, $rest;
@@ -175,7 +206,9 @@ sub replace {
 ###########################################
 sub full_line_match {
 ###########################################
-    my($string, $rex) = @_;
+    my($self, $string, $rex) = @_;
+
+    DEBUG "Trying to match '$string' with /$rex/";
 
     # Try a regex match and if it succeeds, extend the match
     # to cover the full first and last line. Return a ref to
@@ -184,8 +217,18 @@ sub full_line_match {
     my @positions = ();
 
     while($string =~ /($rex)/g) {
-        my $first = pos($string) - length($1) - 1;
-        my $last  = pos($string);
+        my $first = pos($string) - length($1);
+        my $last  = pos($string) - 1;
+
+        DEBUG "Found match at pos $first-$last ($1) pos=", pos($string);
+
+            # Is this match located in any of the forbidden zones?
+        my $intersect = Set::IntSpan::intersect(
+                            $self->{forbidden_zones}, "$first-$last");
+        unless(Set::IntSpan::empty($intersect)) {
+            DEBUG "Match was in forbidden zone - skipped";
+            next;
+        }
 
             # Go back to the start of the line
         while($first and
@@ -198,6 +241,14 @@ sub full_line_match {
         while($last < length($string) and
               substr($string, $last, 1) ne "\n") {
             $last++;
+        }
+
+        DEBUG "Match positions corrected to $first-$last (line start/end)";
+
+            # Ignore overlapping matches
+        if(@positions and $positions[-1]->[1] > $first) {
+            DEBUG "Detected overlap (two matches in same line) - skipped";
+            next;
         }
 
         push @positions, [$first, $last];
@@ -223,7 +274,8 @@ sub remove {
     my $new_content = "";
 
     $self->file_parse(
-        sub { my($p, $k, $m, $t) = @_;
+        sub { my($p, $k, $m, $t, $p1, $p2, $header) = @_;
+              DEBUG "Remove: '$t' ($p1-$p2)";
               if($k eq $self->{key}) {
                   if($m eq "replace") {
                        # We've got a replace section, extract its
@@ -235,7 +287,7 @@ sub remove {
                   }
               } else {
                       # This isn't our patch
-                  $new_content .= $t;
+                  $new_content .= $header . $t . $header;
               }
             },
         sub { my($p, $t) = @_;
@@ -257,11 +309,16 @@ sub file_parse {
     open FILE, "<$self->{file}" or
         die "Cannot open $self->{file}";
 
-    my $in_patch = 0;
-    my $patch    = "";
-    my $text     = "";
+    my $in_patch  = 0;
+    my $patch     = "";
+    my $text      = "";
+    my $start_pos;
+    my $end_pos;
+    my $pos       = 0;
+    my $header;
 
     while(<FILE>) {
+        $pos += length($_);
         $patch .= $_ if $in_patch and $_ !~ $PATCH_REGEX;
 
             # text line?
@@ -272,13 +329,21 @@ sub file_parse {
             # closing line of patch
         if($_ =~ $PATCH_REGEX and 
            $in_patch) {
-            $patch_cb->($self, $1, $2, $patch);
+            $end_pos = $pos - 1;
+            $patch_cb->($self, $1, $2, $patch, $start_pos, $end_pos, $header);
             $patch = "";
         }
 
             # toggle flag
         if($_ =~ $PATCH_REGEX) {
-            $text_cb->($self, $text) if length $text;
+            if($in_patch) {
+                # End line
+            } else {
+                # Start Line
+                $text_cb->($self, $text);
+                $start_pos = $pos - length $_;
+                $header = $_;
+            }
             $text = "";
             $in_patch = ($in_patch xor 1);
         }
@@ -309,6 +374,28 @@ sub replace_marker {
 
     return "#" .
            "(Config::Patch::replace)";
+}
+
+###############################################
+sub blurt {
+###############################################
+    my($data, $file) = @_;
+    open FILE, ">$file" or die "Cannot open $file ($!)";
+    print FILE $data;
+    close FILE;
+}
+
+###############################################
+sub slurp {
+###############################################
+    my($file) = @_;
+
+    local $/ = undef;
+    open FILE, "<$file" or die "Cannot open $file ($!)";
+    my $data = <FILE>;
+    close FILE;
+
+    return $data;
 }
 
 1;
@@ -360,16 +447,33 @@ that performs all functions:
         # Append a patch
     echo "my patch text" | config-patch -a -k key -f textfile
 
-        # Remove a patch
+        # Patch a file by search-and-replace
+    echo "none:" | config-patch -s 'all:.*' -k key -f config_file
+
+        # Comment out sections matched by a regular expression:
+    config-patch -c '(?ms-xi:^all:.*?\n\n)' -k key -f config_file
+
+
+        # Remove a previously applied patch
     config-patch -r -k key -f textfile
 
 Note that 'patch' doesn't refer to a patch in the format used by the I<patch>
-program, but to an arbitrary section of text inserted into a file.
+program, but to an arbitrary section of text inserted into a file. Patches
+are line-based, C<Config::Patch> always adds/removes entire lines.
 
-C<Config::Patch> is format-agnostic. The only requirement is that lines
-starting with a # character are comment lines. If you need to pay attention
-to the syntax of the configuration file to be patched, use a subclass
-of C<Config::Patch>.
+The only requirement is that lines starting with a # character 
+are comment lines. 
+Other than that, C<Config::Patch> is format-agnostic. 
+If you need to pay attention
+to the syntax of the configuration file to be patched, create a subclass
+of C<Config::Patch> and put the format specific logic there.
+
+You can only patch a file I<once> with a given key. Note that a single
+patch might result in multiple patched sections within a file 
+if you're using the C<replace()> or C<comment_out()> methods.
+
+To apply different patches to the same file, use different keys. They
+can be can rolled back separately.
 
 =head1 METHODS
 
@@ -402,29 +506,34 @@ supplied as C<key =E<gt> $key>.
 Patches by searching for a given pattern $search (regexp) and replacing
 it by the text string C<$replace>. Example:
 
-        # Remove the all: target and all its production 
-        # commands from a Makefile
-    $patcher->replace(qr(^all:.*?\n\n)sm,
-                      "all:\n\n");
+        # Replace the 'all:' target in a Makefile and all 
+        # of its production rules by a dummy rule.
+    $patcher->replace(qr(^all:.*?\n\n)sm, 
+                      "all:\n\techo 'all is gone!'\n");
 
 Note that the replace command will replace I<the entire line> if it
-finds that the regular expression is matching.
+finds that a regular expression is matching a partial line.
 
-CAUTION: Make sure that C<$search> doesn't match a section that contains
-another patch already. C<Config::Patch> can't handle this case yet.
+CAUTION: Make sure your C<$search> patterns only cover the areas
+you'd like to replace. Multiple matches within one line are ignored,
+and so are matches that overlap with areas patched with different
+keys (I<forbidden zones>).
 
 =item C<$patcher-E<gt>comment_out($search)>
 
 Patches by commenting out config lines matching the regular expression
 C<$search>. Example:
 
-        # Remove the function 'somefunction'
-        # commands from a Makefile
-    $patcher->replace(qr(^all:.*?\n\n)sm,
-                      "all:\n\n");
+        # Remove the 'all:' target and its production rules
+        # from a makefile
+    $patcher->comment_out(qr(^all:.*?\n\n)sm);
 
-Note that the replace command will replace I<the entire line> if it
-finds that the regular expression is matching.
+Commenting out is just a special case of C<replace()>. Check its
+documentation for details.
+
+=item C<$patcher-E<gt>key($key)>
+
+Set a new patch key for applying subsequent patches.
 
 =item C<($arrayref, $hashref) = $patcher-E<gt>patches()>
 
