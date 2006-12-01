@@ -13,8 +13,8 @@ use Set::IntSpan;
 use Log::Log4perl qw(:easy);
 use Fcntl qw/:flock/;
 
-our $VERSION     = "0.05";
-our $PATCH_REGEX = qr{^#\(Config::Patch-(.*?)-(.*?)\)}m;
+our $VERSION     = "0.06";
+our $PATCH_REGEX = qr{^#\(Config::Patch-(.*)-(.*?)\)}m;
 
 ###########################################
 sub new {
@@ -528,7 +528,7 @@ Config::Patch - Patch configuration files and unpatch them later
         *-------------------------------------------
 
         # Prepend a patch:
-    $patcher->append(q{
+    $patcher->prepend(q{
         # Log my stuff
         my.*         /var/log/my
     });
