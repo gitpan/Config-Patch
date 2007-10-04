@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                Config-Patch
-version:             0.07
+version:             0.08
 abstract:            Patch configuration files and unpatch them later
 license:             ~
 generated_by:        ExtUtils::MakeMaker version 6.31
