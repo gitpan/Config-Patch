@@ -8,4 +8,5 @@ README
 t/001Basic.t
 t/002Replace.t
 t/003Prepend.t
+t/004HunkApi.t
 META.yml                                 Module meta-data (added by MakeMaker)
